@@ -65,17 +65,13 @@ lcd_putchar(char c, FILE *unused)
 	
 	if (c == '\n')
 	{
-		if (secondLine)
-		{
-			lcd_clear();
-			secondLine = false;
-		}
-		else
-		{
-			hd44780_wait_ready(true);
-			hd44780_outcmd( HD44780_DDADDR(0x40) );
-			secondLine = true;
-		}
+		hd44780_wait_ready(true);
+		
+		const uint8_t nextAddress = secondLine ? 0x00 : 0x40;
+		hd44780_outcmd( HD44780_DDADDR(nextAddress) );
+		
+		
+		secondLine = !secondLine; 
 	}
 	else
 	{
