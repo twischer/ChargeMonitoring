@@ -22,3 +22,6 @@
 *.elf
 *.map
 *.hex
+*.eep
+*.lss
+*.sym
