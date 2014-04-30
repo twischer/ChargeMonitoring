@@ -22,14 +22,14 @@
 // defines mA for one adc change
 #define ADC_TO_CURRENT		131
 // defines mV for one adc change
-#define ADC_TO_VOLTAGE		15
+#define ADC_TO_VOLTAGE		60
 
 
 #define TIMER0_PRESCALER	64
 
 #define MAX_REMAINING_HOURS	999
 
-#define BATTERY_COUNT		8
+#define BATTERY_COUNT		6
 
 
 #define NAH_TO_MAH			1000000
@@ -46,14 +46,14 @@
 #define BUFFER_LENGTH		9
 
 // use internal reference voltage
-#define AD_REF_VOLTAGE		( (1<<REFS1) | (1<<REFS0) )
+#define AD_STATIC_CONF		( (1<<REFS1) | (1<<REFS0) | (1<<ADLAR) )
 // use diffrential input 1+ and 0- with 200x gain
-#define ADMUX_CURRENT		(AD_REF_VOLTAGE | 0b01011)
+#define ADMUX_CURRENT		(AD_STATIC_CONF | 0b01011)
 // use single ended inputs 2 till 7
-#define ADMUX_VOLTAGE(offset)	( AD_REF_VOLTAGE | (0b00010 + offset) )
+#define ADMUX_VOLTAGE(offset)	( AD_STATIC_CONF | (0b00010 + offset) )
 
 // contains the last value which was read from the adc
-volatile uint16_t lastADCValue = 0;
+volatile int16_t lastADCValue = 0;
 // the current which is running now (in mA)
 volatile int32_t current = 0;
 // the capacity change of the last mesurments (in nAh)
@@ -78,7 +78,6 @@ void convertValueToString(const int32_t value, const uint8_t integerPlaces, cons
 // - adc wert an current kopieren
 // - static int32_t newCapacityDiff in nAh
 // wenn > 1mAh, 1mAh auf remainingCapacity addieren
-// - adc neu starten (single conversion um energie zu sparen)
 
 
 ISR (TIMER0_OVF_vect)
@@ -88,8 +87,13 @@ ISR (TIMER0_OVF_vect)
 	
 	if (isCurrentMeasurement)
 	{
-		//	lastADCValue = ADC;	// TODO only for finding the right configuration
+		if (ADCSRA & (1<<ADIF))
+			lastADCValue = ADC;	// TODO only for finding the right configuration
+		else
+			lastADCValue = 0xFFFF;
 		
+		ADCSRA |= (1<<ADIF);
+/*		
 		// TODO bei differnetial input is ergebnis signd (also ADC0- mit spannungsteiler oder vielleicht 
 		// ergebnis auch richtig wenn im erweiterten positiven bereich)
 		// calulate the current of the mesurnment (in mA)
@@ -97,32 +101,36 @@ ISR (TIMER0_OVF_vect)
 		current = -6000;//(int32_t)(adcWithoutOffset) * ADC_TO_CURRENT;
 		
 		// set up next voltage measurement
-		isCurrentMeasurement = false;
-		lastVoltageMeasurement = (lastVoltageMeasurement + 1) % BATTERY_COUNT;
-		ADMUX = ADMUX_VOLTAGE(lastVoltageMeasurement);
+*/		isCurrentMeasurement = false;
+//		lastVoltageMeasurement = (lastVoltageMeasurement + 1) % BATTERY_COUNT;
+//		ADMUX = ADMUX_VOLTAGE(lastVoltageMeasurement);		// TODO erzeugt fehler immer 128 für lastADCValue dann
 	}
 	else
 	{
 		// save result of last voltage measurment
-		voltages[lastVoltageMeasurement] = ADC;
+//		voltages[lastVoltageMeasurement] = ADC;
 		
 		// set up next current measurement
 		isCurrentMeasurement = true;
-		ADMUX = ADMUX_CURRENT;
+		
+		// TODO testen ob bei ADC0 vs ADC0 kein offste 0b01010
+		// TODO testen mit 10x gain 0b01001
+		ADMUX = AD_STATIC_CONF | 0b01010;
+		//ADMUX_CURRENT;
 	}
 	
 	// start new conversion
 	ADCSRA |= (1 << ADSC);
-	
+/*	
 	// capacity difference of this current mesurment (in mAµmin = nAmin)
 	int32_t newCapacityDiff = current * TIMER0_DELAY_UMIN;
 	// capacity (in nAh)
 	newCapacityDiff /= 60;
 	// capacitiy difference of the last mesurments (in nAh)
 	capacityDifference += newCapacityDiff;
+	*/
 	
-	
-	lastADCValue = TCNT0;
+//	lastADCValue = TCNT0;
 }
 
 
@@ -131,27 +139,26 @@ int main(void)
 	lcd_init();
 	stdout = &lcd_str;
 	
-	// TODO überprüfen ob mit attiny26 auch das gleiche
-	
 	// init adc
 	//first conversion should be a current detection
 	ADMUX = ADMUX_CURRENT;
 	// frequency for convertion should be between 50 and 200kHz
 	// so use a prescaler of 16 @2MHz
-	ADCSRA = (1 << ADPS2) | (0 << ADPS1) | (0 << ADPS0);
+	ADCSRA = (1 << ADEN) | (1 << ADPS2) | (0 << ADPS1) | (0 << ADPS0);
 	// start new conversion
 	ADCSRA |= (1 << ADSC);
-	
+/*	
 	// Timer 0 konfigurieren
-	TCCR0 = (0 << CS02) | (1 << CS01) | (1 << CS00); // Prescaler 64
+	TCCR0 = (1 << CS02) | (0 << CS01) | (1 << CS00); // Prescaler 1024	TODO wieder schneller machen
 	
 	// Overflow Interrupt erlauben
 	TIMSK |= (1 << TOIE0);
-	
+	*/
 	// Global Interrupts aktivieren
 	sei();
 	
 	
+	// TODO save and reload value from eeprom
 	// the remaining capacity of the batteries (in mAh)
 	int32_t remainingCapacity = 6000;
 	
@@ -167,6 +174,9 @@ int main(void)
 	uint8_t displayTimeout = 0;
 	while (true)
 	{
+		while ( !(ADCSRA & (1<<ADIF)) );
+		lastADCValue = ADC;
+		
 		// copy remaining capacity from nAh to mAh buffer
 		if (capacityDifference > NAH_TO_MAH)
 		{
@@ -195,9 +205,13 @@ int main(void)
 		if (displayTimeout > DISPLAY_TIMEOUT)
 		{
 			displayTimeout = 0;
-			showVoltages = !showVoltages;
+//			showVoltages = !showVoltages;
 		}
 		displayTimeout++;
+		
+		
+		ADMUX = AD_STATIC_CONF | 0b00001;
+		ADCSRA |= (1 << ADSC);
 		
 		// use a display refreshing rate of 50 Hz
 		// it have to be smaller than 72ms,
@@ -213,13 +227,13 @@ int main(void)
 
 void showVoltagesOfAllBatteries(void)
 {
-	for (uint8_t i=0; i<4; i++)
+	for (uint8_t i=0; i<(BATTERY_COUNT/2); i++)
 	{
 		printVoltage(i);
 	}
 	printf_P( PSTR("\n") );
 	
-	for (uint8_t i=4; i<BATTERY_COUNT; i++)
+	for (uint8_t i=(BATTERY_COUNT/2); i<BATTERY_COUNT; i++)
 	{
 		printVoltage(i);
 	}
@@ -229,8 +243,10 @@ void showVoltagesOfAllBatteries(void)
 
 void printVoltage(const uint8_t batteryNr)
 {
+	const uint16_t voltageInVolts = voltages[batteryNr] / ADC_TO_VOLTAGE;
+	
 	char convertedString[BUFFER_LENGTH];
-	convertValueToString(voltages[batteryNr], 2, 2, convertedString);
+	convertValueToString(voltageInVolts, 2, 2, convertedString);
 	printf_P( PSTR("%s "), convertedString );
 }
 
@@ -250,7 +266,7 @@ void showCurrentAndTime(const int32_t remainingCapacity)
 	if (remainingCapacity > 0)// TODO only for testing && remainingHours <= MAX_REMAINING_HOURS)
 	{
 		const uint8_t remainingMinutes = (uint8_t)(remainingTimeInMinutes % 60);
-		printf_P( PSTR("%04d Rem. time: %03d:%02d h\n"), lastADCValue, remainingHours, remainingMinutes );
+		printf_P( PSTR("%07d Rem. time: %03d:%02d h\n"), lastADCValue, remainingHours, remainingMinutes );
 	}
 	else
 	{
