@@ -8,40 +8,45 @@
 
 #include <avr/io.h>
 #include <avr/interrupt.h>
+#include <avr/sleep.h>
 #include <avr/pgmspace.h>
+#include <avr/eeprom.h>
 
 #include <util/delay.h>
+#include <util/atomic.h>
 
 #include "defines.h"
 #include "lcd.h"
+#include "avgfilter.h"
 
-// time which will be waited until the information on the display will toggled between voltages and current
-#define DISPLAY_TIMEOUT		200
+// time (in 40ms) which will be waited until the information on the display will be refreshed
+#define DISPLAY_REFRESH_TIMEOUT	20
+// time (in 40ms) which will be waited until the information on the display will toggled between voltages and current
+#define DISPLAY_SWITCH_TIMEOUT	200
 
-#define ADC_OFFSET			18
+// TODO find the right values for the current measurnment
+#define ADC_OFFSET			0
 // defines mA for one adc change
-#define ADC_TO_CURRENT		131
+#define ADC_TO_CURRENT		1
 // defines mV for one adc change
-#define ADC_TO_VOLTAGE		60
-
-
-#define TIMER0_PRESCALER	64
+#define ADC_TO_VOLTAGE		40
+// if the difference of the last update of the eeprom capacity value (in mAh)
+// is bigger than that value, the new capacitiy value will be saved
+// in the eeprom
+// is used to reload the old value, if the avr restarts
+#define CAPACITY_UPDATE_DIFF	5000
 
 #define MAX_REMAINING_HOURS	999
 
 #define BATTERY_COUNT		6
 
-
+// nAh to mAh
 #define NAH_TO_MAH			1000000
 
-// The frequency of the timer 0 (in Hz)
-#define TIMER0_FREQUENCY	( F_CPU / (TIMER0_PRESCALER * 256) )
-// the delay of timer 0 (in µs)
-// should by 8192µs for 2MHz and a prescaler of 64 on an 8 bit timer
-#define TIMER0_DELAY_US		(1000000 / TIMER0_FREQUENCY)
-// the delay of timer 0 (in µmin)
-// should be 136 µmin
-#define TIMER0_DELAY_UMIN	(TIMER0_DELAY_US / 60)
+// normally it should be 136µmin for a prescaler of 64 @2MHz
+// but this results in an error of 4,6% of the capacitiy change
+// so use a bigger value
+#define TIMER0_DELAY_UMIN	142
 
 #define BUFFER_LENGTH		9
 
@@ -52,34 +57,36 @@
 // use single ended inputs 2 till 7
 #define ADMUX_VOLTAGE(offset)	( AD_STATIC_CONF | (0b00010 + offset) )
 
+// the capacitiy (in mAh) before the avr resets
+int32_t eeRemainingCapacity EEMEM = 0;
 // contains the last value which was read from the adc
-volatile int16_t lastADCValue = 0;
+//volatile int16_t lastADCValue = 0;
 // the current which is running now (in mA)
 volatile int32_t current = 0;
 // the capacity change of the last mesurments (in nAh)
 volatile int32_t capacityDifference = 0;
 // voltages of all batteries (in mV)
-volatile int16_t voltages[BATTERY_COUNT];
+volatile uint16_t voltages[BATTERY_COUNT];
 
 
 FILE lcd_str = FDEV_SETUP_STREAM(lcd_putchar, NULL, _FDEV_SETUP_WRITE);
 
+void updateRemCapacity(int32_t* const remainingCapacity);
+void writeRemCapacityToEEPROM(const int32_t remainingCapacity);
 void showVoltagesOfAllBatteries(void);
 void printVoltage(const uint8_t batteryNr);
-
 void showCurrentAndTime(const int32_t remainingCapacity);
-
 void convertValueToString(const int32_t value, const uint8_t integerPlaces, const uint8_t decimalPlaces, char string[]);
 
 
-// TODO adc auf 62,5kHz mit 16er Teiler
+ISR (ADC_vect)
+{
+	// the adc result will be safed in the timer0 interrupt
+	// so no data exchange between this two interrupts is needed
+}
 
-// TODO Timer auf 1kHz
-// - adc wert an current kopieren
-// - static int32_t newCapacityDiff in nAh
-// wenn > 1mAh, 1mAh auf remainingCapacity addieren
-
-
+// With a prescaler of 64 @2MHz every 8,192ms the interrupt will be called
+// so every 16,384ms the current will be measured
 ISR (TIMER0_OVF_vect)
 {
 	static bool isCurrentMeasurement = true;
@@ -87,50 +94,53 @@ ISR (TIMER0_OVF_vect)
 	
 	if (isCurrentMeasurement)
 	{
-		if (ADCSRA & (1<<ADIF))
-			lastADCValue = ADC;	// TODO only for finding the right configuration
-		else
-			lastADCValue = 0xFFFF;
+		const int16_t newValue = ADC;
+		AVGFilter_add(newValue);
 		
-		ADCSRA |= (1<<ADIF);
-/*		
-		// TODO bei differnetial input is ergebnis signd (also ADC0- mit spannungsteiler oder vielleicht 
-		// ergebnis auch richtig wenn im erweiterten positiven bereich)
 		// calulate the current of the mesurnment (in mA)
-		const int16_t adcWithoutOffset = (int16_t)(ADC) - ADC_OFFSET;
-		current = -6000;//(int32_t)(adcWithoutOffset) * ADC_TO_CURRENT;
+		const int16_t avgValue = AVGFilter_get();
+		const int16_t adcWithoutOffset = avgValue - ADC_OFFSET;
+		current = (int32_t)(adcWithoutOffset) * ADC_TO_CURRENT;
 		
 		// set up next voltage measurement
-*/		isCurrentMeasurement = false;
-//		lastVoltageMeasurement = (lastVoltageMeasurement + 1) % BATTERY_COUNT;
-//		ADMUX = ADMUX_VOLTAGE(lastVoltageMeasurement);		// TODO erzeugt fehler immer 128 für lastADCValue dann
+		isCurrentMeasurement = false;
+		lastVoltageMeasurement = (lastVoltageMeasurement + 1) % BATTERY_COUNT;
+		ADMUX = ADMUX_VOLTAGE(lastVoltageMeasurement);
 	}
 	else
 	{
 		// save result of last voltage measurment
-//		voltages[lastVoltageMeasurement] = ADC;
+		voltages[lastVoltageMeasurement] = ADC;
 		
 		// set up next current measurement
 		isCurrentMeasurement = true;
 		
-		// TODO testen ob bei ADC0 vs ADC0 kein offste 0b01010
-		// TODO testen mit 10x gain 0b01001
-		ADMUX = AD_STATIC_CONF | 0b01010;
-		//ADMUX_CURRENT;
+		// adc1 => max 64 (wohl 1 bit)
+		// TODO testen ob bei ADC0 vs ADC0 200x kein offste 0b01010 => max -128-448
+		// ADC0 10x 0b01000 => max 192-256
+		// TODO testen mit 10x gain 0b01001 => max 704
+		// 200x gain => 2500-7400
+		ADMUX = ADMUX_CURRENT;
 	}
 	
-	// start new conversion
-	ADCSRA |= (1 << ADSC);
-/*	
 	// capacity difference of this current mesurment (in mAµmin = nAmin)
 	int32_t newCapacityDiff = current * TIMER0_DELAY_UMIN;
 	// capacity (in nAh)
 	newCapacityDiff /= 60;
 	// capacitiy difference of the last mesurments (in nAh)
 	capacityDifference += newCapacityDiff;
-	*/
 	
-//	lastADCValue = TCNT0;
+/*	
+	const int16_t newValue = TCNT0;
+	if (newValue > lastADCValue)
+		lastADCValue = newValue;
+*/
+	// set avr to sleep mode and start adc conversion
+	// reduce noise which will be generated by the cpu
+	// interrupts have to be enabled before sleeping
+	// otherwise the adc interrupt could not wake up the cpu
+	sei();
+	sleep_mode();
 }
 
 
@@ -139,89 +149,111 @@ int main(void)
 	lcd_init();
 	stdout = &lcd_str;
 	
+	AVGFilter_reset();
+	
 	// init adc
 	//first conversion should be a current detection
 	ADMUX = ADMUX_CURRENT;
 	// frequency for convertion should be between 50 and 200kHz
 	// so use a prescaler of 16 @2MHz
-	ADCSRA = (1 << ADEN) | (1 << ADPS2) | (0 << ADPS1) | (0 << ADPS0);
+	// Interrupt only activated to wake up the avr from sleep mode, if a conversion is finisched
+	ADCSRA = (1 << ADEN) | (1 << ADPS2) | (0 << ADPS1) | (0 << ADPS0) | (1 << ADIE);
 	// start new conversion
 	ADCSRA |= (1 << ADSC);
-/*	
+	
+	// Configure sleep mode for adc noise reduction
+	set_sleep_mode(SLEEP_MODE_ADC);
+	
 	// Timer 0 konfigurieren
-	TCCR0 = (1 << CS02) | (0 << CS01) | (1 << CS00); // Prescaler 1024	TODO wieder schneller machen
+	TCCR0 = (0 << CS02) | (1 << CS01) | (1 << CS00); // Prescaler 64
 	
 	// Overflow Interrupt erlauben
 	TIMSK |= (1 << TOIE0);
-	*/
+	
 	// Global Interrupts aktivieren
 	sei();
 	
 	
-	// TODO save and reload value from eeprom
 	// the remaining capacity of the batteries (in mAh)
-	int32_t remainingCapacity = 6000;
-	
-	// reset capacitiy calulation if the remaning capacitiy is negative and the batteries are charging now
-	// possiblly the batteries has grown or was charged externally before
-	if (remainingCapacity < 0 && current > 0)
-	{
-		remainingCapacity = 0;
-	}
-	
+	// reload the last value before the reset from the eeprom
+	int32_t remainingCapacity = eeprom_read_dword( (uint32_t*)&eeRemainingCapacity );
 	
 	bool showVoltages = false;
 	uint8_t displayTimeout = 0;
 	while (true)
 	{
-		while ( !(ADCSRA & (1<<ADIF)) );
-		lastADCValue = ADC;
+		updateRemCapacity(&remainingCapacity);
+		writeRemCapacityToEEPROM(remainingCapacity);
 		
-		// copy remaining capacity from nAh to mAh buffer
-		if (capacityDifference > NAH_TO_MAH)
-		{
-			capacityDifference -= NAH_TO_MAH;
-			remainingCapacity++;
-		}
-		else if (capacityDifference < -NAH_TO_MAH)
-		{
-			capacityDifference += NAH_TO_MAH;
-			remainingCapacity--;
-		}
+		// TODO 10%-35% der geladenen kapazität nach beendigung des ladens abziehen
+		// da blei akkus nur 65%-90% wirkungsgrad haben
+		// http://de.statista.com/statistik/daten/studie/156269/umfrage/wirkungsgrade-von-ausgewaehlten-stromspeichern/
 		
 		
-		// show the requestet informations on the lcd
-		if (showVoltages)
+		if ( (displayTimeout % DISPLAY_REFRESH_TIMEOUT) == 0 )
 		{
-			showVoltagesOfAllBatteries();
-		}
-		else
-		{
-			showCurrentAndTime(remainingCapacity);
+			// show the requestet informations on the lcd
+			if (showVoltages)
+				showVoltagesOfAllBatteries();
+			else
+				showCurrentAndTime(remainingCapacity);
 		}
 		
 		
 		// toggle between the shown information after a choosen timeout
-		if (displayTimeout > DISPLAY_TIMEOUT)
+		if (displayTimeout > DISPLAY_SWITCH_TIMEOUT)
 		{
 			displayTimeout = 0;
-//			showVoltages = !showVoltages;
+			showVoltages = !showVoltages;
 		}
 		displayTimeout++;
 		
-		
-		ADMUX = AD_STATIC_CONF | 0b00001;
-		ADCSRA |= (1 << ADSC);
-		
-		// use a display refreshing rate of 50 Hz
+		// use a capacity calulation rate of 25Hz
 		// it have to be smaller than 72ms,
 		//  because this time is needed to discharge 2mAh @100A
 		// 2mAh is nearly the biggest value of the variable capacityDifference
-		_delay_ms(20);
-		
+		// 100A * 40ms = 4As * h/(3600s) = 1112 µAh
+		_delay_ms(40);
 	}
 	
 	return 0;
+}
+
+
+void updateRemCapacity(int32_t* const remainingCapacity)
+{
+	// copy remaining capacity from nAh to mAh buffer
+	if (capacityDifference > NAH_TO_MAH)
+	{
+		ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+		{
+			capacityDifference -= NAH_TO_MAH;
+		}
+		(*remainingCapacity)++;
+	}
+	else if (capacityDifference < -NAH_TO_MAH)
+	{
+		ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+		{
+			capacityDifference += NAH_TO_MAH;
+		}
+		(*remainingCapacity)--;
+	}
+	
+	// reset capacitiy calulation if the remaning capacitiy is negative and the batteries are charging now
+	// possiblly the batteries has grown or was charged externally before
+	if (*remainingCapacity < 0 && current > 0)
+	{
+		*remainingCapacity = 0;
+	}
+}
+
+
+void writeRemCapacityToEEPROM(const int32_t remainingCapacity)
+{
+	static int32_t lastSavedCapacity = 0;
+	if ( abs(remainingCapacity - lastSavedCapacity) > CAPACITY_UPDATE_DIFF )
+		eeprom_read_dword( (uint32_t*)&eeRemainingCapacity );
 }
 
 
@@ -247,7 +279,7 @@ void printVoltage(const uint8_t batteryNr)
 	
 	char convertedString[BUFFER_LENGTH];
 	convertValueToString(voltageInVolts, 2, 2, convertedString);
-	printf_P( PSTR("%s "), convertedString );
+	printf_P( PSTR("%sV  "), convertedString );
 }
 
 
@@ -261,16 +293,26 @@ void showCurrentAndTime(const int32_t remainingCapacity)
 	printf_P( PSTR("%s Ah\n"), convertedString );
 	
 	
-	const uint32_t remainingTimeInMinutes = remainingCapacity * 60 / -current;
-	const uint16_t remainingHours = (uint16_t)(remainingTimeInMinutes / 60);
-	if (remainingCapacity > 0)// TODO only for testing && remainingHours <= MAX_REMAINING_HOURS)
+	if (current < 0)
 	{
-		const uint8_t remainingMinutes = (uint8_t)(remainingTimeInMinutes % 60);
-		printf_P( PSTR("%07d Rem. time: %03d:%02d h\n"), lastADCValue, remainingHours, remainingMinutes );
+		const uint32_t remainingTimeInMinutes = remainingCapacity * 60 / -current;
+		const uint16_t remainingHours = (uint16_t)(remainingTimeInMinutes / 60);
+		// only show if there is remaining capacity and the batteries will be discharged
+		if (remainingCapacity > 0)// TODO only for testing && remainingHours <= MAX_REMAINING_HOURS)
+		{
+			const uint8_t remainingMinutes = (uint8_t)(remainingTimeInMinutes % 60);
+			const uint8_t lastADCValue = TIMER0_DELAY_UMIN;
+			printf_P( PSTR("%07d Rem. time: %03d:%02d h\n"), lastADCValue, remainingHours, remainingMinutes );
+//			printf_P( PSTR("Rem. time: %04d:%02d h    \n"), remainingHours, remainingMinutes );
+		}
+		else
+		{
+			printf_P( PSTR("Rem. time not available.\n") );
+		}
 	}
 	else
 	{
-		printf_P( PSTR("Rem. time not available.\n") );
+		printf_P( PSTR("Charging batteries...   \n") );
 	}
 }
 
@@ -291,8 +333,8 @@ void convertValueToString(const int32_t value, const uint8_t integerPlaces, cons
 	{
 		if (i == pointPosition)
 		{
-			// add the decimal point to the string
-			string[i] = '.';
+			// add the comma to the string
+			string[i] = ',';
 		}
 		else if (leftNumbers >= endOfCopiing)
 		{
