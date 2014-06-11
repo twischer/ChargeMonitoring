@@ -19,47 +19,49 @@
 #include "lcd.h"
 #include "avgfilter.h"
 
+
 // time (in 40ms) which will be waited until the information on the display will be refreshed
 #define DISPLAY_REFRESH_TIMEOUT	20
 // time (in 40ms) which will be waited until the information on the display will toggled between voltages and current
 #define DISPLAY_SWITCH_TIMEOUT	200
 
 // TODO find the right values for the current measurnment
-#define ADC_OFFSET			0
+#define ADC_OFFSET				0
 // defines mA for one adc change
-#define ADC_TO_CURRENT		1
+#define ADC_TO_CURRENT			1
 // defines mV for one adc change
-#define ADC_TO_VOLTAGE		40
+#define ADC_TO_VOLTAGE			40
 // if the difference of the last update of the eeprom capacity value (in mAh)
 // is bigger than that value, the new capacitiy value will be saved
 // in the eeprom
 // is used to reload the old value, if the avr restarts
 #define CAPACITY_UPDATE_DIFF	5000
 
-#define MAX_REMAINING_HOURS	999
+#define MAX_REMAINING_HOURS		999
 
-#define BATTERY_COUNT		6
+#define BATTERY_COUNT			6
 
 // nAh to mAh
-#define NAH_TO_MAH			1000000
+#define NAH_TO_MAH				1000000
 
 // normally it should be 136µmin for a prescaler of 64 @2MHz
 // but this results in an error of 4,6% of the capacitiy change
 // so use a bigger value
-#define TIMER0_DELAY_UMIN	142
+// with 142µmin there was an error of -0,06%
+#define TIMER0_DELAY_UMIN		142
 
-#define BUFFER_LENGTH		9
+#define BUFFER_LENGTH			9
 
 // use internal reference voltage
-#define AD_STATIC_CONF		( (1<<REFS1) | (1<<REFS0) | (1<<ADLAR) )
+#define AD_STATIC_CONF			( (1<<REFS1) | (1<<REFS0) | (1<<ADLAR) )
 // use diffrential input 1+ and 0- with 200x gain
-#define ADMUX_CURRENT		(AD_STATIC_CONF | 0b01011)
+#define ADMUX_CURRENT			(AD_STATIC_CONF | 0b01011)
 // use single ended inputs 2 till 7
 #define ADMUX_VOLTAGE(offset)	( AD_STATIC_CONF | (0b00010 + offset) )
 
 // the capacitiy (in mAh) before the avr resets
 int32_t eeRemainingCapacity EEMEM = 0;
-// contains the last value which was read from the adc
+// TODO only for testing
 //volatile int16_t lastADCValue = 0;
 // the current which is running now (in mA)
 volatile int32_t current = 0;
@@ -252,8 +254,13 @@ void updateRemCapacity(int32_t* const remainingCapacity)
 void writeRemCapacityToEEPROM(const int32_t remainingCapacity)
 {
 	static int32_t lastSavedCapacity = 0;
-	if ( abs(remainingCapacity - lastSavedCapacity) > CAPACITY_UPDATE_DIFF )
-		eeprom_read_dword( (uint32_t*)&eeRemainingCapacity );
+	
+	const int32_t capacityDifference = abs(remainingCapacity - lastSavedCapacity);
+	if ( capacityDifference > CAPACITY_UPDATE_DIFF )
+	{
+		eeprom_write_dword( (uint32_t*)&eeRemainingCapacity, remainingCapacity );
+		lastSavedCapacity = remainingCapacity;
+	}
 }
 
 
@@ -301,9 +308,8 @@ void showCurrentAndTime(const int32_t remainingCapacity)
 		if (remainingCapacity > 0)// TODO only for testing && remainingHours <= MAX_REMAINING_HOURS)
 		{
 			const uint8_t remainingMinutes = (uint8_t)(remainingTimeInMinutes % 60);
-			const uint8_t lastADCValue = TIMER0_DELAY_UMIN;
-			printf_P( PSTR("%07d Rem. time: %03d:%02d h\n"), lastADCValue, remainingHours, remainingMinutes );
-//			printf_P( PSTR("Rem. time: %04d:%02d h    \n"), remainingHours, remainingMinutes );
+//			printf_P( PSTR("%07d Rem. time: %03d:%02d h\n"), lastADCValue, remainingHours, remainingMinutes );
+			printf_P( PSTR("Rem. time: %04d:%02d h    \n"), remainingHours, remainingMinutes );
 		}
 		else
 		{
